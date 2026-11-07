@@ -1,0 +1,358 @@
+// SPDX-License-Identifier: MIT
+// Oeeoo Coin — the runnable node (Milestone 12).
+// Loads the chain store, starts P2P + JSON-RPC + Stratum, and runs
+// until SIGINT/SIGTERM or the RPC `stop` method.
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <filesystem>
+#include <iostream>
+#include <mutex>
+#include <thread>
+
+#include "app/config.h"
+#include "app/genesis.h"
+#include "consensus/consensus.h"
+#include "consensus/vesting.h"
+#include "db/chainstore.h"
+#include "network/node.h"
+#include "network/protocol.h"
+#include "network/transport.h"
+#include "rpc/rpcserver.h"
+#include "rpc/rpcutil.h"
+#include "rpc/stratum.h"
+#include "wallet/nodewallet.h"
+
+namespace {
+std::atomic<bool> g_stop{false};
+
+void OnSignal(int) { g_stop.store(true); }
+
+std::string HashHex(const oeeoo::Hash256& h) {
+  return oeeoo::BytesToHexStr(
+      std::vector<unsigned char>(h.begin(), h.end()));
+}
+
+
+
+// Derive the vesting parameters from the stored genesis block, so a
+// restart validates founder spends against the same rules as the
+// chain was built with. Returns false only on a database error.
+bool DeriveVestingFromStore(oeeoo::ChainStore& store,
+                            oeeoo::VestingParams& vesting,
+                            std::string& error) {
+  oeeoo::Hash256 tip;
+  std::string tipError;
+  if (!store.LoadTip(tip, tipError)) {
+    return true;  // fresh store: nothing to derive
+  }
+  std::vector<std::tuple<int, oeeoo::BlockHeader, oeeoo::Target>> headers;
+  if (!store.GetAllHeaders(headers, error)) return false;
+  if (headers.empty()) return true;
+  oeeoo::Block genesis;
+  if (!store.GetBlock(std::get<1>(headers[0]).GetHash(), genesis, error)) {
+    return false;
+  }
+  if (genesis.vtx.size() >= 1 && genesis.vtx[0].vout.size() == 1 &&
+      genesis.vtx[0].vout[0].value == oeeoo::FOUNDER_ALLOCATION) {
+    vesting.enabled = true;
+    vesting.launchTime = genesis.header.nTime;
+    vesting.founderScript = genesis.vtx[0].vout[0].scriptPubKey;
+  }
+  return true;
+}
+}  // namespace
+
+int main(int argc, char** argv) {
+  using namespace oeeoo;
+  AppConfig config;
+  std::string error;
+  if (!ParseArgs(argc, argv, config, error)) {
+    std::cerr << "oeeoo-node: " << error << "\n" << UsageText(argv[0]);
+    return 1;
+  }
+  if (config.help) {
+    std::cout << UsageText(argv[0]);
+    return 0;
+  }
+  if (config.version) {
+    std::cout << "oeeoo-node 0.1.0\n";
+    return 0;
+  }
+  // Milestone 20: select the network identity ONCE, before any
+  // P2P framing happens. Default is mainnet; --testnet /
+  // `network=testnet` selects the test-network identity (testnet
+  // magic, testnet default ports, "(testnet)" user agent). From
+  // here on SerializeMessage / ParseMessage frame and check with
+  // the selected network's magic, so this process can never
+  // handshake with a node on the other network.
+  SelectNetwork(config.testnet ? NetworkId::kTestnet
+                               : NetworkId::kMainnet);
+  std::error_code ec;
+  std::filesystem::create_directories(config.dataDir, ec);
+  if (ec) {
+    std::cerr << "oeeoo-node: cannot create data directory " << config.dataDir
+              << "\n";
+    return 1;
+  }
+  ChainStore store;
+  if (!store.Open(config.dataDir + "/chain.db", error)) {
+    std::cerr << "oeeoo-node: " << error << "\n";
+    return 1;
+  }
+  // Vesting parameters, before the chain is loaded: an explicit
+  // genesis file wins, then the config script, then the stored
+  // genesis block.
+  VestingParams vesting;
+  Block genesis;
+  bool haveGenesisFile = false;
+  if (!config.genesisFile.empty()) {
+    std::vector<unsigned char> founderScript;
+    if (!ReadGenesisFile(config.genesisFile, genesis, founderScript,
+                         error)) {
+      std::cerr << "oeeoo-node: " << error << "\n";
+      return 1;
+    }
+    vesting.enabled = true;
+    vesting.launchTime = genesis.header.nTime;
+    vesting.founderScript = founderScript;
+    haveGenesisFile = true;
+  } else if (!config.founderScript.empty()) {
+    if (!HexToBytesStr(config.founderScript, vesting.founderScript)) {
+      std::cerr << "oeeoo-node: founder script is not valid hex\n";
+      return 1;
+    }
+    vesting.enabled = true;
+    // launchTime 0: adopted from the stored genesis on load.
+  } else if (!DeriveVestingFromStore(store, vesting, error)) {
+    std::cerr << "oeeoo-node: " << error << "\n";
+    return 1;
+  }
+  Node node(config.powLimitBits);
+  node.SetVestingParams(vesting);
+  node.SetMaxPeers(config.maxPeers);
+  node.SetMaxMempoolBytes(config.maxMempoolBytes);
+  node.AttachStore(&store);
+  if (!node.LoadFromStore(store, error, config.deepVerify)) {
+    std::cerr << "oeeoo-node: " << error << "\n";
+    return 1;
+  }
+  // Genesis identity. A --genesis-file must match the genesis block
+  // already in the data directory: a different genesis is refused,
+  // never silently ignored. A --genesis-checkpoint must match the
+  // genesis that is actually loaded (from the store, or from the
+  // file on a fresh directory).
+  if (!CheckGenesisIdentity(node, genesis, haveGenesisFile,
+                            config.genesisCheckpoint, error)) {
+    std::cerr << "oeeoo-node: " << error << "\n";
+    return 1;
+  }
+  if (node.TipHeight() < 0) {
+    if (!haveGenesisFile) {
+      std::cerr << "oeeoo-node: fresh data directory and no genesis file.\n"
+                   "Generate one with oeeoo-genesis and pass "
+                   "--genesis-file <path>.\n";
+      return 1;
+    }
+    if (!node.BroadcastBlock(genesis, error)) {
+      std::cerr << "oeeoo-node: genesis rejected: " << error << "\n";
+      return 1;
+    }
+    std::cout << "Genesis accepted: " << HashHex(genesis.GetHash()) << "\n";
+  }
+  // Mempool persistence (Milestone 17): load after the chain (and
+  // a fresh genesis, above) is in place, so re-validation sees
+  // the current UTXO set. A failed load warns and the node starts
+  // with an empty mempool — losing the mempool loses no funds.
+  node.SetMempoolPath(config.dataDir + "/mempool.dat");
+  node.SetPersistMempool(config.persistMempool);
+  if (config.persistMempool) {
+    std::string mempoolError;
+    if (!node.LoadMempool(mempoolError)) {
+      std::cerr << "oeeoo-node: warning: mempool load failed: "
+                << mempoolError << "\n";
+    } else {
+      const MempoolLoadStats stats = node.LastMempoolLoadStats();
+      if (stats.loaded > 0 || stats.droppedExpired > 0 ||
+          stats.droppedInvalid > 0) {
+        std::cout << "Mempool: loaded " << stats.loaded
+                  << " transaction(s), dropped " << stats.droppedExpired
+                  << " expired, " << stats.droppedInvalid << " invalid\n";
+      }
+    }
+  }
+  // Node wallet (Milestone 14). A relative path resolves against the
+  // data directory. An existing file loads LOCKED; a missing file is
+  // remembered so the operator can create it with the createwallet
+  // RPC. A corrupt file refuses startup loudly.
+  NodeWallet nodeWallet;
+  bool walletConfigured = false;
+  std::string walletPathStr;
+  if (!config.walletFile.empty()) {
+    std::filesystem::path walletPath(config.walletFile);
+    if (walletPath.is_relative()) {
+      walletPath = std::filesystem::path(config.dataDir) / walletPath;
+    }
+    walletPathStr = walletPath.string();
+    if (!nodeWallet.LoadFile(walletPathStr, error)) {
+      std::cerr << "oeeoo-node: " << error << "\n";
+      return 1;
+    }
+    walletConfigured = true;
+  }
+  for (const std::string& seed : config.dnsSeeds) {
+    node.AddDnsSeed(seed);
+  }
+  if (!config.dnsSeeds.empty() && node.AddrMan().Size() == 0) {
+    std::string seedError;
+    const std::size_t added = node.QueryDnsSeeds(seedError);
+    std::cout << "DNS seeds: " << added << " peer address(es) found";
+    if (!seedError.empty()) std::cout << " (" << seedError << ")";
+    std::cout << "\n";
+  }
+  // Manually added peers (Milestone 18, --addnode / `addnode`
+  // config key): into the address manager, so the dial loop in
+  // Node::Poll dials them. A malformed address refuses startup
+  // loudly — a typo here would otherwise silently leave the node
+  // with no peers.
+  for (const std::string& peerAddr : config.addNodes) {
+    std::string addError;
+    if (!node.AddManualPeer(peerAddr, addError)) {
+      std::cerr << "oeeoo-node: --addnode: " << addError << "\n";
+      return 1;
+    }
+  }
+  auto transport = std::make_shared<TcpTransport>();
+  node.SetTransport(transport);
+  // Milestone 20: listen on the EFFECTIVE P2P port — the explicit
+  // --port, else the selected network's default (64775 mainnet,
+  // 64779 testnet).
+  const uint16_t p2pPort = config.EffectivePort();
+  if (!node.Listen(p2pPort)) {
+    std::cerr << "oeeoo-node: cannot listen on P2P port " << p2pPort
+              << "\n";
+    return 1;
+  }
+  std::mutex nodeMutex;
+  RpcServer rpc(node, config.EffectiveRpcPort(), config.dataDir,
+                &nodeMutex);
+  if (walletConfigured) rpc.AttachNodeWallet(&nodeWallet);
+  // M16: RPC load control (Core-style thread count + bounded work
+  // queue). Defaults are 16 threads / 64 queued when unconfigured.
+  rpc.SetMaxThreads(config.rpcThreads);
+  rpc.SetWorkQueueSize(config.rpcWorkQueueSize);
+  if (!rpc.Start(error)) {
+    std::cerr << "oeeoo-node: RPC failed to start: " << error << "\n";
+    return 1;
+  }
+  StratumServer stratum(node, config.EffectiveStratumPort(), &nodeMutex);
+  bool stratumOn = false;
+  if (!config.minerAddress.empty()) {
+    stratum.SetMinerAddress(config.minerAddress);
+    if (!stratum.Start(error)) {
+      std::cerr << "oeeoo-node: Stratum failed to start: " << error << "\n";
+      return 1;
+    }
+    stratumOn = true;
+  }
+  // M20 close-out fix: ActiveNetworkMagic() returns the magic BY
+  // VALUE, so calling it twice for .begin()/.end() takes iterators
+  // from two DIFFERENT temporaries — undefined behaviour. The
+  // normal build printed the magic doubled (e2d804d6e2d804d6) and
+  // the ASan build aborted at startup with a stack-buffer-overflow
+  // (READ of size 20), which broke every real-node spawn in the
+  // ASan suite (m17b cascade). Capture it once in a local.
+  const std::array<unsigned char, 4> bannerMagic = ActiveNetworkMagic();
+  std::cout << "Oeeoo Coin node 0.1.0\n"
+            << "  network: "
+            << ActiveNetworkIdentity().name << " (magic "
+            << BytesToHexStr(std::vector<unsigned char>(
+                   bannerMagic.begin(), bannerMagic.end()))
+            << ", user agent " << ActiveUserAgent() << ")\n"
+            << "  data dir: " << config.dataDir << "\n"
+            << "  height: " << node.TipHeight()
+            << "  tip: " << HashHex(node.TipHash()) << "\n"
+            << "  P2P: " << config.EffectivePort()
+            << "  RPC: 127.0.0.1:" << config.EffectiveRpcPort()
+            << "  Stratum: "
+            << (stratumOn ? std::to_string(config.EffectiveStratumPort())
+                           : "off")
+            << "\n"
+            << "  vesting: " << (vesting.enabled ? "enabled" : "disabled")
+            << "\n"
+            << "  wallet: "
+            << (!walletConfigured
+                    ? "none"
+                    : (nodeWallet.HasWallet()
+                           ? walletPathStr + " (locked)"
+                           : walletPathStr +
+                                 " (not created yet — use createwallet RPC)"))
+            << "\n";
+  if (config.powLimitBits != 0x1d00ffff) {
+    // A non-mainnet proof-of-work limit means this node is on a
+    // test chain, not Mainnet. Say so loudly: an operator who
+    // passes --pow-limit-bits on a mainnet data directory would
+    // otherwise silently run a different chain.
+    std::cout << "  *** WARNING: TESTING MODE — proof-of-work limit is "
+                 "0x"
+              << std::hex << config.powLimitBits << std::dec
+              << ", not the mainnet limit 0x1d00ffff. This node is "
+                 "NOT on Mainnet. ***\n";
+  }
+  if (config.testnet) {
+    // Milestone 20: say so loudly — a testnet node is NOT on
+    // Mainnet and can never peer with a mainnet node (different
+    // magic). The PoW limit is a separate setting; testnet
+    // identity alone does not change consensus.
+    std::cout << "  *** TESTNET — test-network identity; this node is "
+                 "NOT on Mainnet and can never peer with a mainnet "
+                 "node. ***\n";
+  }
+  std::cout << std::flush;
+  std::signal(SIGINT, OnSignal);
+  std::signal(SIGTERM, OnSignal);
+  // M17: surface chain-store failures loudly. Block acceptance keeps
+  // serving the in-memory chain when persistence fails (the blocks
+  // roll back on restart instead of corrupting), so without this the
+  // failure is silent at runtime — LastStoreError() was the only
+  // record, with no consumer. Warn once per distinct error.
+  std::string lastReportedStoreError;
+  while (!g_stop.load() && !rpc.StopRequested()) {
+    node.Poll(100);
+    const std::string storeError = node.LastStoreError();
+    if (!storeError.empty() && storeError != lastReportedStoreError) {
+      std::cerr << "oeeoo-node: WARNING: chain store error — accepted "
+                   "blocks may not be durable: "
+                << storeError << "\n";
+      lastReportedStoreError = storeError;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  std::cout << "Shutting down...\n";
+  if (stratumOn) stratum.Stop();
+  rpc.Stop();
+  if (walletConfigured) {
+    // Persist the indices, then wipe the keys from memory. Lock()
+    // saves again best-effort; the explicit save here surfaces an
+    // I/O failure as a warning instead of swallowing it.
+    std::string walletError;
+    if (!nodeWallet.SaveIfDirty(walletError)) {
+      std::cerr << "oeeoo-node: warning: cannot save wallet: " << walletError
+                << "\n";
+    }
+    nodeWallet.Lock();
+  }
+  // Mempool persistence (Milestone 17): save on clean shutdown so
+  // the next start reloads the same transactions. A failure warns
+  // instead of failing the shutdown — the chain store above is
+  // the durable state; the mempool is recoverable from peers.
+  if (config.persistMempool) {
+    std::string mempoolError;
+    if (!node.SaveMempool(mempoolError)) {
+      std::cerr << "oeeoo-node: warning: cannot save mempool: "
+                << mempoolError << "\n";
+    }
+  }
+  store.Close();
+  return 0;
+}
